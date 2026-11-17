@@ -5,6 +5,8 @@ from fastembed import TextEmbedding
 from pinecone import Pinecone, ServerlessSpec
 
 from config import PINECONE_API_KEY, INDEX_NAME, EMBED_DIM
+from guardrails import MAX_CHUNKS_PER_FILE
+from pii import MASK_PII_IN_DOCS, mask_pii
 from readers import read_document
 
 CHUNK_SIZE = 800
@@ -62,11 +64,18 @@ def safe_id(s):
     return re.sub(r"[^A-Za-z0-9_-]", "_", s)
 
 
-def ingest_file(file_obj, filename, namespace):
-    """Read, chunk, embed and upsert one file. Returns the number of chunks."""
-    records = []
-    counter = 0
-    for page_num, text in read_document(file_obj, filename):
+def ingest_file(file_obj, filename, namespace, vision_limit=None):
+    """Read, mask PII, chunk, embed and upsert one file. Returns a report dict."""
+    pages, report = read_document(file_obj, filename, vision_limit)
+    report["chunks"] = 0
+    report["pii"] = {}
+
+    records, counter = [], 0
+    for page_num, text in pages:
+        if MASK_PII_IN_DOCS:
+            text, found = mask_pii(text)      # mask before chunking so nothing is split across chunks
+            for label, n in found.items():
+                report["pii"][label] = report["pii"].get(label, 0) + n
         for chunk in chunk_text(text):
             records.append({
                 "id": f"{safe_id(filename)}-{counter}",
@@ -76,8 +85,9 @@ def ingest_file(file_obj, filename, namespace):
             })
             counter += 1
 
+    records = records[:MAX_CHUNKS_PER_FILE]
     if not records:
-        return 0
+        return report
 
     for i in range(0, len(records), BATCH):
         batch = records[i:i + BATCH]
@@ -92,7 +102,8 @@ def ingest_file(file_obj, filename, namespace):
         ]
         _index.upsert(vectors=vectors, namespace=namespace)
 
-    return len(records)
+    report["chunks"] = len(records)
+    return report
 
 
 def wait_until_indexed(namespace, expected, timeout=15):

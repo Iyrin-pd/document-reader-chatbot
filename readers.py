@@ -7,6 +7,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from config import MAX_VISION_CALLS
+from image_safety import scan_image
 from vision import describe_image
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
@@ -15,16 +16,34 @@ SHEET_GROUP_CHARS = 500
 
 
 class Budget:
-    """Caps how many vision calls one file can use."""
+    """Caps vision calls for one file and records what was skipped or blocked."""
 
     def __init__(self, n):
-        self.n = n
+        self.n = max(0, n)
+        self.used = 0
+        self.skipped = 0
+        self.invalid = 0
+        self.blocked = []
 
     def take(self):
         if self.n <= 0:
+            self.skipped += 1
             return False
         self.n -= 1
+        self.used += 1
         return True
+
+
+def _vision(image_bytes, mode, budget):
+    """Scan the image first; only safe, valid images reach the OCR model."""
+    status, reason = scan_image(image_bytes)
+    if status == "unsafe":
+        budget.blocked.append(reason)
+        return ""
+    if status == "invalid":
+        budget.invalid += 1
+        return ""
+    return describe_image(image_bytes, mode)
 
 
 def rows_to_markdown(rows):
@@ -66,7 +85,7 @@ def read_pdf(data, budget):
         ]
         if (scanned or big_images) and budget.take():
             png = page.get_pixmap(dpi=150).tobytes("png")
-            out = describe_image(png, "transcribe" if scanned else "describe")
+            out = _vision(png, "transcribe" if scanned else "describe", budget)
             if out:
                 label = "Page content (OCR)" if scanned else "Figures on this page"
                 parts.append(f"{label}:\n{out}")
@@ -86,7 +105,7 @@ def read_docx(data, budget):
             parts.append("Table:\n" + md)
     for rel in doc.part.rels.values():
         if "image" in rel.reltype and budget.take():
-            out = describe_image(rel.target_part.blob, "describe")
+            out = _vision(rel.target_part.blob, "describe", budget)
             if out:
                 parts.append("Image in document:\n" + out)
     return [(1, "\n\n".join(parts))] if parts else []
@@ -115,7 +134,7 @@ def read_pptx(data, budget):
                 except Exception:
                     pass
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE and budget.take():
-                out = describe_image(shape.image.blob, "describe")
+                out = _vision(shape.image.blob, "describe", budget)
                 if out:
                     parts.append("Image on slide:\n" + out)
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
@@ -165,25 +184,35 @@ def read_csv(data):
 
 
 # ---------- dispatcher ----------
-def read_document(file_obj, filename):
-    """Return a list of (page_number, text) for any supported file."""
+def read_document(file_obj, filename, vision_limit=None):
+    """Return (pages, report). pages = [(page_number, text)]; report describes image handling."""
     data = file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read()
     name = filename.lower()
-    budget = Budget(MAX_VISION_CALLS)
+    limit = MAX_VISION_CALLS if vision_limit is None else min(MAX_VISION_CALLS, vision_limit)
+    budget = Budget(limit)
 
+    pages = []
     if name.endswith(".pdf"):
-        return read_pdf(data, budget)
-    if name.endswith(".docx"):
-        return read_docx(data, budget)
-    if name.endswith(".pptx"):
-        return read_pptx(data, budget)
-    if name.endswith(".xlsx"):
-        return read_xlsx(data)
-    if name.endswith(".csv"):
-        return read_csv(data)
-    if name.endswith((".txt", ".md")):
-        return [(1, data.decode("utf-8", errors="ignore"))]
-    if name.endswith(IMAGE_EXTS):
-        out = describe_image(data, "image")
-        return [(1, out)] if out else []
-    return []
+        pages = read_pdf(data, budget)
+    elif name.endswith(".docx"):
+        pages = read_docx(data, budget)
+    elif name.endswith(".pptx"):
+        pages = read_pptx(data, budget)
+    elif name.endswith(".xlsx"):
+        pages = read_xlsx(data)
+    elif name.endswith(".csv"):
+        pages = read_csv(data)
+    elif name.endswith((".txt", ".md")):
+        pages = [(1, data.decode("utf-8", errors="ignore"))]
+    elif name.endswith(IMAGE_EXTS):
+        if budget.take():
+            out = _vision(data, "image", budget)
+            if out:
+                pages = [(1, out)]
+
+    report = {
+        "vision_used": budget.used,
+        "blocked": budget.blocked,
+        "skipped": budget.skipped,
+    }
+    return pages, report
